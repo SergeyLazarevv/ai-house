@@ -1,0 +1,46 @@
+# ai-house: LangGraph + агенты (логи, БД, код)
+# Переменные из .env
+# Запуск: docker compose up -d
+
+services:
+  ai-house:
+    build: .
+    ports:
+      - "8020:8000"
+    env_file:
+      - .env
+    environment:
+      - YANDEX_API_KEY=${YANDEX_API_KEY}
+      - YANDEX_CATALOG_ID=${YANDEX_CATALOG_ID}
+      - AGENT_LOGS_ENABLED=${AGENT_LOGS_ENABLED:-true}
+      - AGENT_DB_ENABLED=${AGENT_DB_ENABLED:-true}
+      - AGENT_CODE_ENABLED=${AGENT_CODE_ENABLED:-true}
+      - GRAYLOG_MCP_URL=${GRAYLOG_MCP_URL:-http://host.docker.internal:9000/api/mcp}
+      - GRAYLOG_MCP_AUTH=${GRAYLOG_MCP_AUTH}
+      - POSTGRES_MCP_DSN=${POSTGRES_MCP_DSN}
+      - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://ai-house:8000/v1
+      - OPENAI_API_KEY=ai-house-local-key
+      - WEBUI_AUTH=False
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+      - CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - open-webui-data:/app/backend/data
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    depends_on:
+      - ai-house
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
