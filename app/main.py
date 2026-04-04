@@ -87,7 +87,7 @@ async def status():
             else ("ok" if config.llm_status() == "ok" else "нужен LLM")
         ),
         "graph": "langgraph",
-        "graph_router": config.graph_router,
+        "orchestrator": "llm_supervisor",
     }
 
 

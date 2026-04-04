@@ -14,23 +14,54 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return value in {"1", "true", "yes", "y", "on"}
 
 
+def _graylog_api_base() -> str:
+    explicit = (os.getenv("GRAYLOG_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    legacy = (os.getenv("GRAYLOG_MCP_URL") or "").strip()
+    if legacy:
+        u = legacy.rstrip("/")
+        if u.endswith("/mcp"):
+            u = u[:-4]
+        return u
+    return "http://127.0.0.1:9000/api"
+
+
 @dataclass
 class GraylogConfig:
-    url: str
-    auth: str
+    """REST API Graylog: базовый URL заканчивается на /api (без /mcp)."""
+
+    api_base: str
+    token: str | None
+    username: str | None
+    password: str | None
+    verify_ssl: bool
+    x_requested_by: str
     enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "GraylogConfig":
+        token = (os.getenv("GRAYLOG_TOKEN") or os.getenv("GRAYLOG_MCP_AUTH") or "").strip() or None
+        user = (os.getenv("GRAYLOG_USER") or "").strip() or None
+        password = (os.getenv("GRAYLOG_PASSWORD") or "").strip() or None
+        xrb = (os.getenv("GRAYLOG_X_REQUESTED_BY") or "ai-house").strip() or "ai-house"
         return cls(
-            url=os.getenv("GRAYLOG_MCP_URL", "http://127.0.0.1:9000/api/mcp"),
-            auth=(os.getenv("GRAYLOG_MCP_AUTH") or "").strip(),
+            api_base=_graylog_api_base(),
+            token=token,
+            username=user,
+            password=password,
+            verify_ssl=_env_bool("GRAYLOG_VERIFY_SSL", True),
+            x_requested_by=xrb,
             enabled=_env_bool("AGENT_LOGS_ENABLED", True),
         )
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.url and self.auth)
+        if not self.api_base:
+            return False
+        if self.token:
+            return True
+        return bool(self.username and self.password)
 
 
 @dataclass
@@ -86,8 +117,8 @@ class AppConfig:
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
-    # keyword | llm — выбор маршрута в графе LangGraph (см. GRAPH_ROUTER)
-    graph_router: str = "keyword"
+    # Максимум шагов решения оркестратора (каждый вызов специалиста + решения «что дальше»)
+    graph_supervisor_max_steps: int = 10
     # Агент общих вопросов (только LLM, без Graylog/БД/GitLab)
     general_enabled: bool = True
 
@@ -108,10 +139,8 @@ class AppConfig:
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            graph_router=(
-                os.getenv("GRAPH_ROUTER") or os.getenv("ORCHESTRATOR_ROUTER") or "keyword"
-            ).strip().lower(),
             general_enabled=_env_bool("AGENT_GENERAL_ENABLED", True),
+            graph_supervisor_max_steps=int(os.getenv("GRAPH_SUPERVISOR_MAX_STEPS", "10")),
         )
 
     def llm_status(self) -> str:

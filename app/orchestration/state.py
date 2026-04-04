@@ -11,8 +11,8 @@ class GraphState(TypedDict, total=False):
 
     user_message: str
     trace_id: str
-    route: str  # сырая классификация: logs|db|code|logs_chain|investigate|general|unknown
-    resolved_route: str  # после учёта включённых агентов
+    route: str  # опционально; основной поток — supervisor
+    resolved_route: str
     # Идентификаторы этапов: logs|db|code|general|synthesize — накапливаются по ходу графа
     agents_used: Annotated[list[str], operator.add]
     db_result: str
@@ -20,3 +20,11 @@ class GraphState(TypedDict, total=False):
     code_result: str
     final_response: str
     error: str
+    # Цикл supervisor → специалист → supervisor
+    supervisor_step: int
+    supervisor_next: str  # db|logs|code|general|finish|end
+    supervisor_reason: str
+    # Задание текущего шага: формулирует только оркестратор (не сырой вопрос пользователя)
+    supervisor_task: str
+    # Краткие факты для этого вызова (id, даты, имя input); не полные логи/дампы
+    supervisor_context_hint: str

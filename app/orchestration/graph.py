@@ -1,70 +1,43 @@
-"""Сборка и компиляция графа LangGraph."""
+"""Сборка и компиляция графа LangGraph: цикл supervisor → специалист → supervisor, затем synthesize."""
 
 from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from app.orchestration.nodes import (
-    node_inv_code,
-    node_inv_db,
-    node_inv_db_logs_pipeline,
-    node_inv_logs,
-    node_router,
-    node_run_code,
-    node_run_db,
-    node_run_general,
-    node_run_logs,
-    node_run_logs_chain,
-    node_synthesize,
-    node_unknown,
-    route_after_router,
-)
+from app.orchestration.agent_registry import SPECIALIST_SPECS
+from app.orchestration.nodes import make_specialist_node, node_synthesize
 from app.orchestration.state import GraphState
+from app.orchestration.supervisor import (
+    node_supervisor,
+    route_after_sup_agent,
+    route_after_supervisor,
+)
 
 
 def build_graph() -> StateGraph:
     g = StateGraph(GraphState)
 
-    g.add_node("router", node_router)
-    g.add_node("run_logs", node_run_logs)
-    g.add_node("run_db", node_run_db)
-    g.add_node("run_code", node_run_code)
-    g.add_node("run_logs_chain", node_run_logs_chain)
-    g.add_node("inv_db", node_inv_db)
-    g.add_node("inv_db_logs_pipeline", node_inv_db_logs_pipeline)
-    g.add_node("inv_logs", node_inv_logs)
-    g.add_node("inv_code", node_inv_code)
+    g.add_node("supervisor", node_supervisor)
+    for spec in SPECIALIST_SPECS:
+        g.add_node(spec.node_name, make_specialist_node(spec.role))
     g.add_node("synthesize", node_synthesize)
-    g.add_node("run_general", node_run_general)
-    g.add_node("run_unknown", node_unknown)
 
-    g.add_edge(START, "router")
+    g.add_edge(START, "supervisor")
+    route_map = {spec.role: spec.node_name for spec in SPECIALIST_SPECS}
+    route_map.update({"finish": "synthesize", "end": END})
     g.add_conditional_edges(
-        "router",
-        route_after_router,
-        {
-            "logs": "run_logs",
-            "db": "run_db",
-            "code": "run_code",
-            "logs_chain": "run_logs_chain",
-            "investigate": "inv_db",
-            "investigate_db_logs": "inv_db_logs_pipeline",
-            "general": "run_general",
-            "unknown": "run_unknown",
-        },
+        "supervisor",
+        route_after_supervisor,
+        route_map,
     )
 
-    g.add_edge("run_general", END)
-    g.add_edge("run_logs", END)
-    g.add_edge("run_db", END)
-    g.add_edge("run_code", END)
-    g.add_edge("run_logs_chain", END)
-    g.add_edge("run_unknown", END)
+    for spec in SPECIALIST_SPECS:
+        g.add_conditional_edges(
+            spec.node_name,
+            route_after_sup_agent,
+            {"supervisor": "supervisor", "synthesize": "synthesize"},
+        )
 
-    g.add_edge("inv_db_logs_pipeline", "synthesize")
-    g.add_edge("inv_db", "inv_logs")
-    g.add_edge("inv_logs", "inv_code")
-    g.add_edge("inv_code", "synthesize")
     g.add_edge("synthesize", END)
 
     return g

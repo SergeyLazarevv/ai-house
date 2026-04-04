@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.agents.base import BaseAgent
+from app.agents.prompt_loader import load_agent_prompt
 from app.config import AppConfig
 from app.shared.llm import build_llm
 
@@ -17,11 +18,7 @@ class GeneralAgent(BaseAgent):
                 "Общий агент недоступен: настройте LLM (см. LLM_PROVIDER и ключи в .env)."
             )
         llm = build_llm(self._config)
-        system = (
-            "Ты дружелюбный ассистент. Отвечай кратко и по делу. "
-            "У тебя нет доступа к логам, базам данных и репозиториям — не выдумывай их. "
-            "Если вопрос про инфраструктуру, подскажи обратиться к соответствующим инструментам в системе."
-        )
+        system = load_agent_prompt("general")
         user_text = f"{context}\n\nВопрос: {message}" if context else message
         reply = await llm.complete(
             [

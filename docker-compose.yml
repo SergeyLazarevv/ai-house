@@ -9,14 +9,14 @@ services:
       - "8020:8000"
     env_file:
       - .env
+    # env_file: .env задаёт GRAYLOG_* и остальное. Не дублировать GRAYLOG_TOKEN здесь:
+    # пустая подстановка ${GRAYLOG_TOKEN} перезаписывает токен из env_file.
     environment:
       - YANDEX_API_KEY=${YANDEX_API_KEY}
       - YANDEX_CATALOG_ID=${YANDEX_CATALOG_ID}
       - AGENT_LOGS_ENABLED=${AGENT_LOGS_ENABLED:-true}
       - AGENT_DB_ENABLED=${AGENT_DB_ENABLED:-true}
       - AGENT_CODE_ENABLED=${AGENT_CODE_ENABLED:-true}
-      - GRAYLOG_MCP_URL=${GRAYLOG_MCP_URL:-http://host.docker.internal:9000/api/mcp}
-      - GRAYLOG_MCP_AUTH=${GRAYLOG_MCP_AUTH}
       - POSTGRES_MCP_DSN=${POSTGRES_MCP_DSN}
       - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
       - GITLAB_TOKEN=${GITLAB_TOKEN}

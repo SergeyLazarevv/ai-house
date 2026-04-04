@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import AsyncExitStack
 
 from app.agents.base import BaseAgent
+from app.agents.prompt_loader import load_agent_prompt
 from app.config import AppConfig
 from app.shared.connectors.gitlab import GitLabConnector
 from app.shared.llm import build_llm
@@ -23,7 +24,7 @@ class CodeAgent(BaseAgent):
         if not self._connector.is_configured:
             return "Агент кода: GitLab не настроен (GITLAB_URL)."
         user_text = f"{context}\n\nЗапрос: {message}" if context else message
-        system = "Ты — агент работы с кодом в GitLab. Используй gitlab_get_file, gitlab_list_projects и др. Читай файлы по путям из стектрейсов. Отвечай с фрагментами кода."
+        system = load_agent_prompt("code")
         async with AsyncExitStack() as stack:
             await self._connector.connect(stack)
             tool_names = self._connector.tool_names
