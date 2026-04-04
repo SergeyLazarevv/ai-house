@@ -1,13 +1,16 @@
-"""Узлы графа: вызов агентов и синтез."""
+"""Узлы графа: специалисты в цикле под управлением supervisor и финальный синтез."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from langgraph.config import get_config
 
 from app.agents import get_agent
 from app.config import AppConfig
+from app.orchestration.agent_registry import AgentSpec, SPECIALIST_BY_ROLE
+from app.orchestration.prompts import build_synthesize_system_prompt
 from app.orchestration.state import GraphState
 
 log = logging.getLogger("ai_house.orchestration.nodes")
@@ -17,144 +20,83 @@ def _app_config() -> AppConfig:
     return get_config()["configurable"]["app_config"]
 
 
-async def node_router(state: GraphState) -> dict:
-    """Классификация + resolve по включённым агентам."""
-    from app.orchestration.classifier import classify_route, resolve_route
+def _merge_slot(prev: str | None, new: str) -> str:
+    p = (prev or "").strip()
+    n = (new or "").strip()
+    if not p:
+        return n
+    if not n:
+        return p
+    return f"{p}\n\n--- этап ---\n\n{n}"
 
+
+def _specialist_inputs(state: GraphState) -> tuple[str, str]:
+    """Сообщение и контекст для агента: только задание оркестратора и его краткая выжимка."""
+    task = (state.get("supervisor_task") or "").strip()
+    if not task:
+        task = (state.get("user_message") or "").strip()
+    hint = (state.get("supervisor_context_hint") or "").strip()
+    return task, hint
+
+
+def _clear_supervisor_task() -> dict:
+    return {"supervisor_task": "", "supervisor_context_hint": ""}
+
+
+async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
     cfg = _app_config()
-    msg = state.get("user_message") or ""
-    route = await classify_route(msg, cfg)
-    resolved = resolve_route(route, cfg)
-    log.info(
-        "[%s] route=%s resolved=%s router=%s",
-        state.get("trace_id", ""),
-        route,
-        resolved,
-        cfg.graph_router,
-    )
-    return {"route": route, "resolved_route": resolved}
-
-
-async def node_run_logs(state: GraphState) -> dict:
-    cfg = _app_config()
-    if not cfg.graylog.enabled:
-        return {"final_response": "Агент логов отключен (AGENT_LOGS_ENABLED=false)."}
-    cls = get_agent("logs")
-    if not cls:
-        return {"final_response": "Агент логов недоступен."}
-    agent = cls(cfg)
-    text = await agent.run(state.get("user_message") or "")
-    return {"final_response": text, "logs_result": text, "agents_used": ["logs"]}
-
-
-async def node_run_db(state: GraphState) -> dict:
-    cfg = _app_config()
-    if not cfg.postgres.enabled:
-        return {"final_response": "Агент БД отключен (AGENT_DB_ENABLED=false)."}
-    cls = get_agent("db")
-    if not cls:
-        return {"final_response": "Агент БД недоступен."}
-    agent = cls(cfg)
-    text = await agent.run(state.get("user_message") or "")
-    return {"final_response": text, "db_result": text, "agents_used": ["db"]}
-
-
-async def node_run_code(state: GraphState) -> dict:
-    cfg = _app_config()
-    if not cfg.gitlab.enabled:
-        return {"final_response": "Агент кода отключен (AGENT_CODE_ENABLED=false)."}
-    cls = get_agent("code")
-    if not cls:
-        return {"final_response": "Агент кода недоступен."}
-    agent = cls(cfg)
-    text = await agent.run(state.get("user_message") or "")
-    return {"final_response": text, "code_result": text, "agents_used": ["code"]}
-
-
-async def node_run_logs_chain(state: GraphState) -> dict:
-    cfg = _app_config()
-    if not cfg.graylog.enabled or not cfg.gitlab.enabled:
+    msg, ctx = _specialist_inputs(state)
+    enabled_flags = {
+        "db": cfg.postgres.enabled,
+        "logs": cfg.graylog.enabled,
+        "code": cfg.gitlab.enabled,
+        "general": cfg.general_enabled,
+    }
+    if not enabled_flags.get(spec.role):
+        text = spec.disabled_message
         return {
-            "final_response": "Цепочка логи→код недоступна: включите AGENT_LOGS_ENABLED и AGENT_CODE_ENABLED."
+            spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+            "agents_used": [spec.role],
+            **_clear_supervisor_task(),
         }
-    logs_cls, code_cls = get_agent("logs"), get_agent("code")
-    if not logs_cls or not code_cls:
-        return {"final_response": "Цепочка логи→код недоступна."}
-    msg = state.get("user_message") or ""
-    logs_agent = logs_cls(cfg)
-    code_agent = code_cls(cfg)
-    logs_result = await logs_agent.run(msg)
-    code_result = await code_agent.run(
-        "По результатам логов выше: найди пути к файлам и строкам в трейсах, получи фрагменты кода и кратко опиши причину ошибок.",
-        context=logs_result,
-    )
-    final = f"## Результат по логам\n\n{logs_result}\n\n## Контекст кода\n\n{code_result}"
+    cls = get_agent(spec.role)
+    if not cls:
+        text = spec.unavailable_message
+        return {
+            spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+            "agents_used": [spec.role],
+            **_clear_supervisor_task(),
+        }
+    text = await cls(cfg).run(msg, context=ctx)
+    log.info("[%s] %s done", state.get("trace_id", ""), spec.node_name)
     return {
-        "final_response": final,
-        "logs_result": logs_result,
-        "code_result": code_result,
-        "agents_used": ["logs", "code"],
+        spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+        "agents_used": [spec.role],
+        **_clear_supervisor_task(),
     }
 
 
-async def node_inv_db_logs_pipeline(state: GraphState) -> dict:
-    """Расследование без GitLab: БД → логи → далее synthesize."""
-    cfg = _app_config()
-    db_cls, logs_cls = get_agent("db"), get_agent("logs")
-    if not db_cls or not cfg.postgres.enabled:
-        return {"db_result": "[БД недоступна]"}
-    if not logs_cls or not cfg.graylog.enabled:
-        return {"logs_result": "[Логи недоступны]"}
-    msg = state.get("user_message") or ""
-    db_result = await db_cls(cfg).run(msg)
-    logs_result = await logs_cls(cfg).run(msg, context=db_result)
-    return {"db_result": db_result, "logs_result": logs_result, "agents_used": ["db", "logs"]}
+def make_specialist_node(role: str) -> Callable[[GraphState], dict]:
+    spec = SPECIALIST_BY_ROLE[role]
 
+    async def _node(state: GraphState) -> dict:
+        return await _run_specialist(state, spec)
 
-async def node_inv_db(state: GraphState) -> dict:
-    cfg = _app_config()
-    cls = get_agent("db")
-    if not cls or not cfg.postgres.enabled:
-        return {"db_result": "", "error": "БД недоступна для расследования."}
-    agent = cls(cfg)
-    text = await agent.run(state.get("user_message") or "")
-    return {"db_result": text, "agents_used": ["db"]}
-
-
-async def node_inv_logs(state: GraphState) -> dict:
-    cfg = _app_config()
-    cls = get_agent("logs")
-    if not cls or not cfg.graylog.enabled:
-        return {"logs_result": "", "error": "Логи недоступны для расследования."}
-    agent = cls(cfg)
-    ctx = state.get("db_result") or ""
-    text = await agent.run(state.get("user_message") or "", context=ctx)
-    return {"logs_result": text, "agents_used": ["logs"]}
-
-
-async def node_inv_code(state: GraphState) -> dict:
-    cfg = _app_config()
-    cls = get_agent("code")
-    if not cls or not cfg.gitlab.enabled:
-        return {"code_result": "", "error": "Код/GitLab недоступен для расследования."}
-    agent = cls(cfg)
-    ctx = f"{state.get('db_result', '')}\n\n{state.get('logs_result', '')}"
-    text = await agent.run(
-        "По результатам БД и логов ниже: найди файлы и строки по трейсам, фрагменты кода, причину ошибки.",
-        context=ctx,
-    )
-    return {"code_result": text, "agents_used": ["code"]}
+    return _node
 
 
 async def node_synthesize(state: GraphState) -> dict:
-    """Сводный ответ после расследования."""
+    """Сводный ответ по результатам специалистов (порядок вызовов задавал оркестратор)."""
     cfg = _app_config()
+    gen = (state.get("final_response") or "").strip()
     if cfg.llm_status() != "ok":
         parts = [
             f"## БД\n{state.get('db_result', '')}",
             f"## Логи\n{state.get('logs_result', '')}",
             f"## Код\n{state.get('code_result', '')}",
         ]
+        if gen:
+            parts.append(f"## Общий агент\n{gen}")
         return {"final_response": "\n\n".join(parts), "agents_used": ["synthesize"]}
 
     from app.shared.llm import build_llm
@@ -164,17 +106,15 @@ async def node_synthesize(state: GraphState) -> dict:
         f"Вопрос пользователя:\n{state.get('user_message', '')}\n\n"
         f"## БД\n{state.get('db_result', '')}\n\n"
         f"## Логи\n{state.get('logs_result', '')}\n\n"
-        f"## Код\n{state.get('code_result', '')}"
+        f"## Код\n{state.get('code_result', '')}\n\n"
+        f"## Общий агент (если вызывался)\n{gen}"
     )
     try:
         text = await llm.complete(
             [
                 {
                     "role": "system",
-                    "content": (
-                        "Ты ведущий инженер поддержки. Сведи результаты этапов в один связный ответ на языке "
-                        "пользователя: статус, причины, выводы. Не выдумывай факты, опирайся только на данные выше."
-                    ),
+                    "content": build_synthesize_system_prompt(),
                 },
                 {"role": "user", "content": user_block},
             ]
@@ -182,39 +122,11 @@ async def node_synthesize(state: GraphState) -> dict:
         return {"final_response": text.strip(), "agents_used": ["synthesize"]}
     except Exception:
         log.exception("synthesize failed")
-        return {
-            "final_response": "\n\n".join(
-                [
-                    f"## БД\n{state.get('db_result', '')}",
-                    f"## Логи\n{state.get('logs_result', '')}",
-                    f"## Код\n{state.get('code_result', '')}",
-                ]
-            ),
-            "agents_used": ["synthesize"],
-        }
-
-
-async def node_run_general(state: GraphState) -> dict:
-    cfg = _app_config()
-    if not cfg.general_enabled:
-        return {"final_response": "Общий агент отключен (AGENT_GENERAL_ENABLED=false)."}
-    cls = get_agent("general")
-    if not cls:
-        return {"final_response": "Общий агент недоступен."}
-    agent = cls(cfg)
-    text = await agent.run(state.get("user_message") or "")
-    return {"final_response": text, "agents_used": ["general"]}
-
-
-async def node_unknown(state: GraphState) -> dict:
-    return {
-        "final_response": (
-            "Нет доступных агентов: включите AGENT_GENERAL_ENABLED и/или специализированных агентов "
-            "(AGENT_LOGS_ENABLED / AGENT_DB_ENABLED / AGENT_CODE_ENABLED) и задайте запрос снова."
-        )
-    }
-
-
-def route_after_router(state: GraphState) -> str:
-    """Следующий узел по resolved_route (ключи path_map в graph.py)."""
-    return state.get("resolved_route") or "unknown"
+        parts = [
+            f"## БД\n{state.get('db_result', '')}",
+            f"## Логи\n{state.get('logs_result', '')}",
+            f"## Код\n{state.get('code_result', '')}",
+        ]
+        if gen:
+            parts.append(f"## Общий агент\n{gen}")
+        return {"final_response": "\n\n".join(parts), "agents_used": ["synthesize"]}

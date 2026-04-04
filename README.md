@@ -7,18 +7,14 @@
 1. **Настройте `.env`** — ключи LLM (`LLM_PROVIDER` и связанные переменные), при необходимости интеграции: Graylog, Postgres, GitLab. Включите нужных агентов флагами `AGENT_*_ENABLED`.
 2. **Запустите** `docker compose up -d` — API на порту **8020** (см. ниже).
 3. **Отправляйте задачу текстом** — `POST /api/chat` с `{"message": "..."}` или OpenWebUI на порту **3000**, если сервис поднят в compose.
-4. **Маршрут** выбирается автоматически:
-   - `GRAPH_ROUTER=keyword` — эвристика по ключевым словам в `app/orchestration/classifier.py`;
-   - `GRAPH_ROUTER=llm` — классификация через LLM (нужен рабочий LLM).
-5. **Новые сценарии** добавляются в граф: узлы и рёбра в `app/orchestration/graph.py`, правила — в `classifier.py` (и при `llm` — в промпт классификатора).
-
-Устаревшее имя переменной `ORCHESTRATOR_ROUTER` по-прежнему читается, если `GRAPH_ROUTER` не задан.
+4. **Маршрут** и порядок шагов выбирает LLM-оркестратор: он решает, кого вызвать дальше (`db`, `logs`, `code`, `general`) и когда завершать ответ через `synthesize`.
+5. **Новые сценарии** добавляются в граф и промпт оркестратора: основная логика живёт в `app/orchestration/graph.py` и `app/orchestration/supervisor.py`.
 
 ### Общие вопросы (приветствия, мелкий small talk)
 
-При **keyword**-маршрутизации запрос без явных признаков логов, БД, кода и расследования классифицируется как **`general`** и обрабатывается **агентом общих вопросов** (`app/agents/general/`), только через LLM — без Graylog/Postgres/GitLab.
+Если оркестратор считает, что внешние системы не нужны, он выбирает **`general`**, и запрос обрабатывается **агентом общих вопросов** (`app/agents/general/`), только через LLM — без Graylog/Postgres/GitLab.
 
-- Включение: `AGENT_GENERAL_ENABLED=true` (по умолчанию включён). Если выключить, такие запросы перенаправятся к первому доступному специалисту или в ветку «неизвестно».
+- Включение: `AGENT_GENERAL_ENABLED=true` (по умолчанию включён). Если выключить, оркестратор будет опираться только на специализированных агентов.
 - Статус в `GET /api/status`: поле `general` — `disabled` | `ok` | `нужен LLM`.
 
 ---
@@ -27,8 +23,8 @@
 
 | Путь в коде | Назначение |
 |-------------|------------|
-| `app/orchestration/graph.py` | Узлы (агенты, расследование, синтез) и условные переходы |
-| `app/orchestration/classifier.py` | `keyword` или `llm`, маршруты: `logs`, `db`, `code`, `logs_chain`, `investigate`, `investigate_db_logs`, `general`, … |
+| `app/orchestration/graph.py` | Цикл `supervisor -> specialist -> supervisor -> synthesize` |
+| `app/orchestration/supervisor.py` | LLM-оркестратор: выбор следующего шага, задание специалисту, context hint |
 
 ---
 
