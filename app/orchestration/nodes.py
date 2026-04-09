@@ -31,16 +31,55 @@ def _merge_slot(prev: str | None, new: str) -> str:
 
 
 def _specialist_inputs(state: GraphState) -> tuple[str, str]:
-    """Сообщение и контекст для агента: только задание оркестратора и его краткая выжимка."""
+    """Сообщение и контекст для агента: задание оркестратора и краткая выжимка."""
     task = (state.get("supervisor_task") or "").strip()
     if not task:
         task = (state.get("user_message") or "").strip()
     hint = (state.get("supervisor_context_hint") or "").strip()
+    # Исходный вопрос нужен даже при нетривиальном task: оркестратор может сократить формулировку
+    # и потерять ключевые слова («топ N по частоте» и т.д.), от которых зависят эвристики агентов.
+    original = (state.get("user_message") or "").strip()
+    if original and original != task:
+        sep = "\n\n--- исходный вопрос пользователя ---\n"
+        hint = f"{hint}{sep}{original}".strip() if hint else f"--- исходный вопрос пользователя ---\n{original}"
     return task, hint
 
 
 def _clear_supervisor_task() -> dict:
     return {"supervisor_task": "", "supervisor_context_hint": ""}
+
+
+def _looks_like_tool_error(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    markers = (
+        "http ",
+        "сеть / запрос",
+        "ошибка",
+        "агент логов:",
+        "graylog не настроен",
+        "ошибка mcp",
+        "mcp-сессия graylog не подключена",
+    )
+    return t.startswith(markers) or "не удалось" in t
+
+
+def _deterministic_error_response(logs_text: str) -> str:
+    facts: list[str] = []
+    for line in (logs_text or "").splitlines():
+        cleaned = line.strip()
+        if cleaned and cleaned != "--- этап ---":
+            facts.append(cleaned)
+    if not facts:
+        facts = ["Не удалось получить данные из логов."]
+    bullets = "\n".join(f"- {fact}" for fact in facts[:5])
+    return (
+        "1. Кратко: не удалось получить итоговые данные из логов.\n"
+        "2. Факты:\n"
+        f"{bullets}\n"
+        "3. Вывод: исправьте ошибку инструмента или маршрута Graylog и повторите запрос."
+    )
 
 
 async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
@@ -89,6 +128,12 @@ async def node_synthesize(state: GraphState) -> dict:
     """Сводный ответ по результатам специалистов (порядок вызовов задавал оркестратор)."""
     cfg = _app_config()
     gen = (state.get("final_response") or "").strip()
+    logs_text = (state.get("logs_result") or "").strip()
+    if _looks_like_tool_error(logs_text):
+        return {
+            "final_response": _deterministic_error_response(logs_text),
+            "agents_used": ["synthesize"],
+        }
     if cfg.llm_status() != "ok":
         parts = [
             f"## БД\n{state.get('db_result', '')}",

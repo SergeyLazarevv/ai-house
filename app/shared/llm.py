@@ -8,6 +8,13 @@ import httpx
 
 from app.config import AppConfig
 
+import json
+import logging
+
+
+_LOG = logging.getLogger("ai_house.llm")
+_LOG_MAX_CHARS = 12_000
+
 
 def _msg_text(m: dict[str, Any]) -> str:
     c = m.get("content", m.get("text"))
@@ -16,6 +23,88 @@ def _msg_text(m: dict[str, Any]) -> str:
     if isinstance(c, str):
         return c
     return str(c)
+
+
+def _truncate_text(text: str, limit: int = _LOG_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 80] + "\n… [обрезано]"
+
+
+def _safe_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _logged_messages(messages: list[dict[str, Any]]) -> str:
+    compact: list[dict[str, Any]] = []
+    for m in messages:
+        compact.append(
+            {
+                "role": m.get("role"),
+                "content": _truncate_text(_msg_text(m), limit=2500),
+            }
+        )
+    return _truncate_text(_safe_json(compact))
+
+
+def _extract_text_from_value(value: Any) -> str:
+    """Достаёт текст из ответа провайдера, даже если тот вернул вложенные блоки."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = _extract_text_from_value(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "output"):
+            if key in value:
+                text = _extract_text_from_value(value.get(key))
+                if text:
+                    return text
+        # Частые блоки у OpenAI/Anthropic-подобных ответов.
+        for key in ("choices", "alternatives", "content"):
+            if key in value:
+                text = _extract_text_from_value(value.get(key))
+                if text:
+                    return text
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            return value["text"]
+        if isinstance(value.get("message"), dict):
+            text = _extract_text_from_value(value["message"])
+            if text:
+                return text
+        # Последний безопасный fallback: сериализуем содержимое без вложенных объектов.
+        flat = []
+        for k, v in value.items():
+            if k in {"role", "type"}:
+                continue
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                flat.append(str(v) if v is not None else "")
+        return "\n".join(part for part in flat if part)
+    return str(value)
+
+
+def _extract_yandex_text(data: dict[str, Any]) -> str:
+    result = data.get("result") or {}
+    alternatives = result.get("alternatives") or []
+    for alt in alternatives:
+        if not isinstance(alt, dict):
+            continue
+        message = alt.get("message")
+        if message is None:
+            continue
+        text = _extract_text_from_value(message)
+        if text:
+            return text
+    return _extract_text_from_value(result)
 
 
 @runtime_checkable
@@ -32,6 +121,7 @@ class YandexLLM:
 
     async def complete(self, messages: list[dict[str, Any]]) -> str:
         async with httpx.AsyncClient(timeout=120.0) as client:
+            _LOG.info("llm request provider=yandex messages=%s", _logged_messages(messages))
             r = await client.post(
                 self._url,
                 headers={"Authorization": f"Api-Key {self._api_key}"},
@@ -43,7 +133,9 @@ class YandexLLM:
             )
             r.raise_for_status()
             data = r.json()
-            return data["result"]["alternatives"][0]["message"]["text"]
+            text = _extract_yandex_text(data)
+            _LOG.info("llm response provider=yandex text=%s", _truncate_text(text))
+            return text
 
 
 class AnthropicLLM:
@@ -74,6 +166,11 @@ class AnthropicLLM:
             if role not in ("user", "assistant"):
                 role = "user"
             conv.append({"role": role, "content": text})
+        _LOG.info(
+            "llm request provider=anthropic system=%s messages=%s",
+            _truncate_text("\n\n".join(system_parts)),
+            _truncate_text(_safe_json(conv)),
+        )
         payload: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
@@ -101,7 +198,12 @@ class AnthropicLLM:
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
                 parts.append(b["text"])
-        return "\n".join(parts) if parts else ""
+        if parts:
+            text = "\n".join(parts)
+        else:
+            text = _extract_text_from_value(data)
+        _LOG.info("llm response provider=anthropic text=%s", _truncate_text(text))
+        return text
 
 
 class OpenAICompatibleLLM:
@@ -118,6 +220,7 @@ class OpenAICompatibleLLM:
             "model": self._model,
             "messages": [{"role": m.get("role", "user"), "content": _msg_text(m)} for m in messages],
         }
+        _LOG.info("llm request provider=openai messages=%s", _logged_messages(messages))
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
@@ -137,8 +240,15 @@ class OpenAICompatibleLLM:
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     texts.append(part.get("text") or "")
-            return "\n".join(texts)
-        return str(content) if content is not None else ""
+            if texts:
+                return "\n".join(texts)
+        text = _extract_text_from_value(msg)
+        if text:
+            _LOG.info("llm response provider=openai text=%s", _truncate_text(text))
+            return text
+        text = _extract_text_from_value(data)
+        _LOG.info("llm response provider=openai text=%s", _truncate_text(text))
+        return text
 
 
 def build_llm(config: AppConfig) -> LLM:

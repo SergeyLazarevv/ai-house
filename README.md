@@ -4,7 +4,7 @@
 
 ## Как пользоваться
 
-1. **Настройте `.env`** — ключи LLM (`LLM_PROVIDER` и связанные переменные), при необходимости интеграции: Graylog, Postgres, GitLab. Включите нужных агентов флагами `AGENT_*_ENABLED`.
+1. **Настройте `.env`** — ключи LLM (`LLM_PROVIDER` и связанные переменные), при необходимости интеграции: Graylog (для MCP-сервера логов), Postgres, GitLab. Включите нужных агентов флагами `AGENT_*_ENABLED`.
 2. **Запустите** `docker compose up -d` — API на порту **8020** (см. ниже).
 3. **Отправляйте задачу текстом** — `POST /api/chat` с `{"message": "..."}` или OpenWebUI на порту **3000**, если сервис поднят в compose.
 4. **Маршрут** и порядок шагов выбирает LLM-оркестратор: он решает, кого вызвать дальше (`db`, `logs`, `code`, `general`) и когда завершать ответ через `synthesize`.
@@ -120,7 +120,7 @@ ai-house/
 | Компонент | Функция |
 |-----------|---------|
 | **Граф** | Маршрутизация, цепочки (`logs_chain`), расследование (`investigate`), синтез |
-| **Агент логов** | Инструменты Graylog (после реализации коннектора) |
+| **Агент логов** | Graylog MCP tools: `search_messages`, `aggregate_messages`, `list_streams`, `list_inputs` |
 | **Агент БД** | Read-only SQL через MCP |
 | **Агент кода** | GitLab REST |
 
@@ -128,7 +128,7 @@ ai-house/
 
 ## Коннекторы
 
-В `app/shared/connectors/` сейчас **заглушки**. Реализуйте `connect` / `call_tool` под ваши MCP или HTTP API; при необходимости добавьте `mcp` в `requirements.txt`.
+В `app/shared/connectors/` лежат клиентские обвязки, а сами MCP-серверы можно держать в `app/mcp_servers/`.
 
 ---
 

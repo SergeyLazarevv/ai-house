@@ -14,54 +14,19 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return value in {"1", "true", "yes", "y", "on"}
 
 
-def _graylog_api_base() -> str:
-    explicit = (os.getenv("GRAYLOG_URL") or "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    legacy = (os.getenv("GRAYLOG_MCP_URL") or "").strip()
-    if legacy:
-        u = legacy.rstrip("/")
-        if u.endswith("/mcp"):
-            u = u[:-4]
-        return u
-    return "http://127.0.0.1:9000/api"
-
-
 @dataclass
 class GraylogConfig:
-    """REST API Graylog: базовый URL заканчивается на /api (без /mcp)."""
+    """Логовый агент включён/выключен. MCP-сервер читает Graylog_* env напрямую."""
 
-    api_base: str
-    token: str | None
-    username: str | None
-    password: str | None
-    verify_ssl: bool
-    x_requested_by: str
     enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "GraylogConfig":
-        token = (os.getenv("GRAYLOG_TOKEN") or os.getenv("GRAYLOG_MCP_AUTH") or "").strip() or None
-        user = (os.getenv("GRAYLOG_USER") or "").strip() or None
-        password = (os.getenv("GRAYLOG_PASSWORD") or "").strip() or None
-        xrb = (os.getenv("GRAYLOG_X_REQUESTED_BY") or "ai-house").strip() or "ai-house"
-        return cls(
-            api_base=_graylog_api_base(),
-            token=token,
-            username=user,
-            password=password,
-            verify_ssl=_env_bool("GRAYLOG_VERIFY_SSL", True),
-            x_requested_by=xrb,
-            enabled=_env_bool("AGENT_LOGS_ENABLED", True),
-        )
+        return cls(enabled=_env_bool("AGENT_LOGS_ENABLED", True))
 
     @property
     def is_configured(self) -> bool:
-        if not self.api_base:
-            return False
-        if self.token:
-            return True
-        return bool(self.username and self.password)
+        return self.enabled
 
 
 @dataclass

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -10,11 +11,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import AppConfig
 from app.graph_entry import run_user_request
+from app.shared.llm import build_llm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,35 @@ class OpenAIChatRequest(BaseModel):
     stream: bool | None = False
 
 
+def _is_ui_meta_request(prompt: str) -> bool:
+    text = (prompt or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    strong_markers = (
+        "suggest 3-5 relevant follow-up questions",
+        "### chat history:",
+        'json format: { "follow_ups":',
+        '"follow_ups":',
+    )
+    weak_markers = (
+        "### task:",
+        "follow-up questions",
+        "chat history",
+        "response must be a json array of strings",
+    )
+    if any(marker in lower for marker in strong_markers):
+        return True
+    weak_hits = sum(1 for marker in weak_markers if marker in lower)
+    return weak_hits >= 2
+
+
+async def _run_meta_request(prompt: str, config: AppConfig) -> str:
+    llm = build_llm(config)
+    log.info("meta request bypassed graph")
+    return (await llm.complete([{"role": "user", "content": prompt}])).strip()
+
+
 @app.get("/")
 async def root():
     return RedirectResponse(url="/docs")
@@ -60,7 +91,10 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Сообщение не может быть пустым")
     config = AppConfig.from_env()
     try:
-        response = await run_user_request(msg, config)
+        if _is_ui_meta_request(msg):
+            response = await _run_meta_request(msg, config)
+        else:
+            response = await run_user_request(msg, config)
         return ChatResponse(response=response)
     except Exception as e:
         log.exception("Ошибка обработки запроса")
@@ -147,7 +181,10 @@ async def openai_chat_completions(req: OpenAIChatRequest):
 
     config = AppConfig.from_env()
     try:
-        answer = await run_user_request(prompt, config)
+        if _is_ui_meta_request(prompt):
+            answer = await _run_meta_request(prompt, config)
+        else:
+            answer = await run_user_request(prompt, config)
     except Exception as e:
         log.exception("Ошибка OpenAI-совместимого endpoint")
         raise HTTPException(status_code=500, detail=str(e))
@@ -155,6 +192,64 @@ async def openai_chat_completions(req: OpenAIChatRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     model = req.model or "ai-house-default"
+    if req.stream:
+        async def _event_stream():
+            first_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+
+            content_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": answer},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     return {
         "id": completion_id,
         "object": "chat.completion",
