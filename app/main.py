@@ -115,11 +115,6 @@ async def status():
         "gitlab": "disabled" if not config.gitlab.enabled else ("ok" if config.gitlab.is_configured else "не настроен"),
         "llm": config.llm_status(),
         "llm_provider": config.llm_provider,
-        "general": (
-            "disabled"
-            if not config.general_enabled
-            else ("ok" if config.llm_status() == "ok" else "нужен LLM")
-        ),
         "graph": "langgraph",
         "orchestrator": "llm_supervisor",
     }

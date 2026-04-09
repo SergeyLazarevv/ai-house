@@ -89,7 +89,6 @@ async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
         "db": cfg.postgres.enabled,
         "logs": cfg.graylog.enabled,
         "code": cfg.gitlab.enabled,
-        "general": cfg.general_enabled,
     }
     if not enabled_flags.get(spec.role):
         text = spec.disabled_message

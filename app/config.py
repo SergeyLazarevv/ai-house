@@ -84,8 +84,6 @@ class AppConfig:
     openai_model: str = "gpt-4o-mini"
     # Максимум шагов решения оркестратора (каждый вызов специалиста + решения «что дальше»)
     graph_supervisor_max_steps: int = 10
-    # Агент общих вопросов (только LLM, без Graylog/БД/GitLab)
-    general_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -104,7 +102,6 @@ class AppConfig:
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            general_enabled=_env_bool("AGENT_GENERAL_ENABLED", True),
             graph_supervisor_max_steps=int(os.getenv("GRAPH_SUPERVISOR_MAX_STEPS", "10")),
         )
 

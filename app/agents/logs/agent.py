@@ -40,18 +40,19 @@ def _timeframe_kwargs_from_obj(obj: dict) -> dict:
     return out
 
 
-def _fallback_tool_from_json(reply: str, tool_names: list[str]) -> tuple[str | None, dict | None]:
+def _fallback_tool_from_json(reply: str, tool_names: list[str]) -> tuple[str | None, dict | None, bool]:
     m = re.search(r"\{[\s\S]*\}", reply.strip())
     if not m:
-        return None, None
+        return None, None, False
     try:
         obj = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return None, None
+        return None, None, False
     if not isinstance(obj, dict):
-        return None, None
+        return None, None, False
 
     tf_kw = _timeframe_kwargs_from_obj(obj)
+    used_default_time = not tf_kw
 
     field = obj.get("field")
     if isinstance(field, str) and field.strip() and "aggregate_messages" in tool_names:
@@ -65,10 +66,10 @@ def _fallback_tool_from_json(reply: str, tool_names: list[str]) -> tuple[str | N
                 args_out["size"] = int(obj["size"])
             except (TypeError, ValueError):
                 pass
-        return "aggregate_messages", args_out
+        return "aggregate_messages", args_out, used_default_time
 
     if "query" not in obj or "search_messages" not in tool_names:
-        return None, None
+        return None, None, False
 
     q = str(obj.get("query", "*")).strip() or "*"
     args_out = {"query": q, **tf_kw}
@@ -82,11 +83,12 @@ def _fallback_tool_from_json(reply: str, tool_names: list[str]) -> tuple[str | N
     rs = obj.get("response_shape")
     if isinstance(rs, str) and rs.strip().lower() in ("count", "samples"):
         args_out["response_shape"] = rs.strip().lower()
-    return "search_messages", args_out
+    return "search_messages", args_out, used_default_time
 
 
 _LOG = logging.getLogger(__name__)
 _MAX_TOOL_RESULT_CHARS = 24_000
+_DEFAULT_TIME_RANGE_SECONDS = 300
 
 
 def _extract_buckets(text: str) -> list[dict] | None:
@@ -200,6 +202,115 @@ def _clip_tool_result_for_llm(text: str) -> str:
     )
 
 
+def _tool_call_uses_default_time(name: str, args: dict | None) -> bool:
+    if name not in {"search_messages", "aggregate_messages"}:
+        return False
+    payload = args or {}
+    return "range_seconds" not in payload and "timeframe" not in payload
+
+
+def _extract_range_seconds(text: str) -> int | None:
+    try:
+        data = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("range_seconds")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _humanize_range_seconds(seconds: int) -> str:
+    if seconds % 604800 == 0:
+        weeks = seconds // 604800
+        return f"последние {weeks} нед." if weeks > 1 else "последнюю неделю"
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return f"последние {days} дн." if days > 1 else "последние сутки"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"последние {hours} ч." if hours > 1 else "последний час"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"последние {minutes} мин."
+    return f"последние {seconds} сек."
+
+
+def _with_default_time_note(text: str, seconds: int | None) -> str:
+    if not text:
+        return text
+    used_seconds = seconds or _DEFAULT_TIME_RANGE_SECONDS
+    note = (
+        f"- Время в запросе не было указано, поэтому использовано окно по умолчанию: "
+        f"{_humanize_range_seconds(used_seconds)}."
+    )
+    marker = "2. Факты:\n"
+    if marker in text and note not in text:
+        return text.replace(marker, f"{marker}{note}\n", 1)
+    if note in text:
+        return text
+    suffix = (
+        "\n\nПримечание: время в запросе не было указано, "
+        f"поэтому использовано окно по умолчанию: {_humanize_range_seconds(used_seconds)}."
+    )
+    return text.rstrip() + suffix
+
+
+def _extract_inputs_catalog(text: str) -> list[dict[str, str]]:
+    try:
+        data = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_inputs = data.get("inputs")
+    if not isinstance(raw_inputs, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw_inputs:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        input_id = str(item.get("id") or "").strip()
+        if title and input_id:
+            out.append({"title": title, "id": input_id})
+    return out
+
+
+def _pick_exact_input_match(text: str, catalog: list[dict[str, str]]) -> dict[str, str] | None:
+    haystack = text.lower()
+    for item in catalog:
+        title = item["title"].strip()
+        if not title:
+            continue
+        if re.search(rf"(?<![\w-]){re.escape(title.lower())}(?![\w-])", haystack):
+            return item
+    return None
+
+
+def _enforce_exact_input_filter(query: str, input_id: str) -> str:
+    enforced = f"gl2_source_input:{input_id}"
+    q = (query or "").strip()
+    if not q or q == "*":
+        return enforced
+    if "gl2_source_input:" in q:
+        return re.sub(r"gl2_source_input\s*:\s*([^\s)]+)", enforced, q)
+    return f"{enforced} AND ({q})"
+
+
+def _force_exact_input_on_args(name: str | None, args: dict | None, exact_input: dict[str, str] | None) -> dict | None:
+    if not name or not args or not exact_input:
+        return args
+    if name not in {"search_messages", "aggregate_messages"}:
+        return args
+    forced = dict(args)
+    forced["query"] = _enforce_exact_input_filter(str(forced.get("query", "*")), exact_input["id"])
+    return forced
+
+
 def _build_logs_system_prompt(tools: list[dict]) -> str:
     parts = [
         load_agent_prompt("logs").strip(),
@@ -231,6 +342,8 @@ class LogsAgent(BaseAgent):
             user_text = f"{context}\n\nЗапрос: {message}" if context else message
             system = _build_logs_system_prompt(self._connector.tools)
             tool_names = self._connector.tool_names
+            default_time_seconds: int | None = None
+            exact_input: dict[str, str] | None = None
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_text},
@@ -251,16 +364,25 @@ class LogsAgent(BaseAgent):
                         f"HTTP {getattr(e.response, 'status_code', '?')}. {body}"
                     ).strip()
                 name, args = parse_tool_call(reply, tool_names)
+                used_default_time = False
+                if name:
+                    used_default_time = _tool_call_uses_default_time(name, args)
                 if not name:
-                    name, args = _fallback_tool_from_json(reply, tool_names)
+                    name, args, used_default_time = _fallback_tool_from_json(reply, tool_names)
                 if not name:
-                    return reply.strip()
+                    return _with_default_time_note(reply.strip(), default_time_seconds) if default_time_seconds else reply.strip()
+                args = _force_exact_input_on_args(name, args, exact_input)
                 result = await self._connector.call_tool(name, args or {})
+                if used_default_time:
+                    default_time_seconds = _extract_range_seconds(result) or default_time_seconds or _DEFAULT_TIME_RANGE_SECONDS
                 if _is_tool_error(result):
                     _LOG.info("logs agent: tool returned error, short-circuiting to user")
                     return result.strip()
+                if name == "list_inputs":
+                    catalog = _extract_inputs_catalog(result)
+                    exact_input = _pick_exact_input_match(f"{context}\n{message}", catalog)
                 if deterministic := _deterministic_aggregate_answer(name, result, message, context):
-                    return deterministic
+                    return _with_default_time_note(deterministic, default_time_seconds) if default_time_seconds else deterministic
                 clipped = _clip_tool_result_for_llm(result)
                 if len(clipped) < len(result):
                     _LOG.info(
@@ -273,7 +395,21 @@ class LogsAgent(BaseAgent):
                     {
                         "role": "user",
                         "content": (
-                            f"[Результат {name}]:\n{clipped}\n\nДай итоговый ответ пользователю."
+                            f"[Результат {name}]:\n{clipped}\n\n"
+                            + (
+                                f"Важно: для окружения используй exact-match по title: `{exact_input['title']}` "
+                                f"с `gl2_source_input:{exact_input['id']}`. Не подменяй его похожими input вроде суффиксов `-nginx` или `-apigw`.\n\n"
+                                if exact_input
+                                else ""
+                            )
+                            + (
+                                "Важно: пользователь не указал время, поэтому для выборки было использовано окно "
+                                f"по умолчанию: {_humanize_range_seconds(default_time_seconds)}. "
+                                "Обязательно явно укажи это в ответе пользователю.\n\n"
+                                if default_time_seconds
+                                else ""
+                            )
+                            + "Дай итоговый ответ пользователю."
                         ),
                     }
                 )

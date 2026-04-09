@@ -11,10 +11,10 @@ from app.orchestration.graph import get_compiled_graph
 log = logging.getLogger("ai_house.orchestration.runner")
 
 _AGENT_LABELS: dict[str, str] = {
+    "orchestrator": "оркестратор",
     "logs": "логи",
     "db": "БД",
     "code": "код",
-    "general": "общий",
     "synthesize": "сводка",
 }
 

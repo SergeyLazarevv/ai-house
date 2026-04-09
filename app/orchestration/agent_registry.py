@@ -36,13 +36,6 @@ SPECIALIST_SPECS: tuple[AgentSpec, ...] = (
         disabled_message="Агент кода отключен (AGENT_CODE_ENABLED=false).",
         unavailable_message="Агент кода недоступен.",
     ),
-    AgentSpec(
-        role="general",
-        node_name="sup_general",
-        result_slot="final_response",
-        disabled_message="Общий агент отключен (AGENT_GENERAL_ENABLED=false).",
-        unavailable_message="Общий агент недоступен.",
-    ),
 )
 
 SPECIALIST_BY_ROLE: dict[str, AgentSpec] = {spec.role: spec for spec in SPECIALIST_SPECS}
