@@ -101,10 +101,25 @@ def _extract_yandex_text(data: dict[str, Any]) -> str:
         message = alt.get("message")
         if message is None:
             continue
+        if isinstance(message, dict):
+            tool_list = ((message.get("toolCallList") or {}).get("toolCalls") or [])
+            if isinstance(tool_list, list) and tool_list:
+                first = tool_list[0] if isinstance(tool_list[0], dict) else {}
+                fn = first.get("functionCall") if isinstance(first, dict) else {}
+                if isinstance(fn, dict):
+                    raw_name = str(fn.get("name") or "").strip()
+                    args = fn.get("arguments") or {}
+                    name = raw_name
+                    if raw_name.lower().startswith("tool_call:"):
+                        name = raw_name.split(":", 1)[1].strip()
+                    if name:
+                        if not isinstance(args, dict):
+                            args = {}
+                        return f"TOOL_CALL: {name}\n{json.dumps(args, ensure_ascii=False)}"
         text = _extract_text_from_value(message)
         if text:
             return text
-    return _extract_text_from_value(result)
+    return ""
 
 
 @runtime_checkable

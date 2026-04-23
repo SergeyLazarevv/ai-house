@@ -19,10 +19,13 @@ class GraylogConfig:
     """Логовый агент включён/выключен. MCP-сервер читает Graylog_* env напрямую."""
 
     enabled: bool = True
+    # Если задано, все запросы к Graylog будут жёстко фильтроваться по этому input title.
+    input_title: str | None = None
 
     @classmethod
     def from_env(cls) -> "GraylogConfig":
-        return cls(enabled=_env_bool("AGENT_LOGS_ENABLED", True))
+        title = (os.getenv("GRAYLOG_INPUT_TITLE") or "").strip() or None
+        return cls(enabled=_env_bool("AGENT_LOGS_ENABLED", True), input_title=title)
 
     @property
     def is_configured(self) -> bool:
@@ -37,7 +40,13 @@ class PostgresConfig:
     @classmethod
     def from_env(cls) -> "PostgresConfig":
         return cls(
-            dsn=(os.getenv("POSTGRES_MCP_DSN") or "").strip() or None,
+            dsn=(
+                os.getenv("POSTGRES_MCP_DSN")
+                or os.getenv("POSTGRES_URL")
+                or os.getenv("POSTGRES_DSN")
+                or ""
+            ).strip()
+            or None,
             enabled=_env_bool("AGENT_DB_ENABLED", True),
         )
 
@@ -62,7 +71,7 @@ class GitLabConfig:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.url)
+        return bool(self.url and self.token)
 
 
 @dataclass

@@ -24,7 +24,26 @@ class GraphState(TypedDict, total=False):
     supervisor_step: int
     supervisor_next: str  # db|logs|code|finish|end
     supervisor_reason: str
+    supervisor_answer_mode: str  # direct|delegate
+    supervisor_target_domain: str  # db|logs|code|none
+    supervisor_needs_external_data: bool
+    supervisor_user_explicitly_requested_source: bool
+    supervisor_confidence: float
     # Задание текущего шага: формулирует только оркестратор (не сырой вопрос пользователя)
     supervisor_task: str
     # Краткие факты для этого вызова (id, даты, имя input); не полные логи/дампы
     supervisor_context_hint: str
+    # Достигнут GRAPH_SUPERVISOR_MAX_STEPS — сводка должна явно это отразить
+    supervisor_truncated: bool
+    # После успешного ответа специалиста — отпечаток (user_message+task+hint); повтор того же delegate → finish
+    logs_success_fingerprint: str
+    db_success_fingerprint: str
+    code_success_fingerprint: str
+    # Счётчики вызовов специалистов за один пользовательский запрос (предохранитель от циклов)
+    logs_invocations: Annotated[int, operator.add]
+    db_invocations: Annotated[int, operator.add]
+    code_invocations: Annotated[int, operator.add]
+    # Единый контракт последнего вызова специалиста: success|error|none и причина ошибки.
+    last_specialist_role: str
+    last_specialist_status: str
+    last_specialist_error: str

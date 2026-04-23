@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections import Counter
 from typing import Any, Literal
 
 import httpx
@@ -18,8 +17,6 @@ _MAX_SEARCH = 150
 _DEFAULT_RANGE = 300
 _DEFAULT_MESSAGE_FIELDS = "timestamp,level,source,message,facility,logger,gl2_source_input"
 _COUNT_ONLY_FIELDS = "timestamp"
-_FALLBACK_PAGE_SIZE = 500
-_FALLBACK_MAX_ROWS = 50_000
 
 
 def _compact_json(data: Any, limit: int | None = None) -> str:
@@ -183,84 +180,6 @@ def _extract_aggregate_buckets(data: Any) -> list[dict[str, Any]]:
     return buckets
 
 
-def _can_fallback_to_client_side_terms(exc: httpx.HTTPStatusError, field: str) -> bool:
-    body = (exc.response.text or "").lower()
-    return (
-        exc.response.status_code == 400
-        and field.strip().lower() in {"message", "full_message", "message.keyword", "full_message.keyword"}
-        and "all shards failed" in body
-    )
-
-
-async def _client_side_terms_aggregation(query: str, field: str, range_sec: int, size: int) -> dict[str, Any]:
-    requested_field = field.strip()
-    field_name = requested_field.removesuffix(".keyword")
-    counter: Counter[str] = Counter()
-    scanned_rows = 0
-    offset = 0
-    truncated = False
-
-    while True:
-        page_size = min(_FALLBACK_PAGE_SIZE, _FALLBACK_MAX_ROWS - scanned_rows)
-        if page_size <= 0:
-            truncated = True
-            break
-
-        data = await _graylog_post(
-            "search/messages",
-            {
-                "query": query,
-                "fields": [field_name],
-                "from": offset,
-                "size": page_size,
-                "timerange": _relative_timerange(range_sec),
-            },
-        )
-
-        schema = data.get("schema") or []
-        rows = data.get("datarows") or []
-        if not isinstance(schema, list) or not isinstance(rows, list):
-            break
-
-        field_idx: int | None = None
-        for idx, column in enumerate(schema):
-            if isinstance(column, dict) and column.get("field") == field_name:
-                field_idx = idx
-                break
-
-        if field_idx is None:
-            break
-
-        for row in rows:
-            if not isinstance(row, list) or len(row) <= field_idx:
-                continue
-            value = row[field_idx]
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text:
-                counter[text] += 1
-
-        fetched = len(rows)
-        scanned_rows += fetched
-        offset += fetched
-        if fetched < page_size:
-            break
-
-    buckets = [{"value": value, "count": count} for value, count in counter.most_common(size)]
-    return {
-        "field": requested_field,
-        "field_used": field_name,
-        "query": query,
-        "range_seconds": range_sec,
-        "mode": "client_side_terms_fallback",
-        "scanned_rows": scanned_rows,
-        "truncated": truncated,
-        "max_rows": _FALLBACK_MAX_ROWS,
-        "buckets": buckets,
-    }
-
-
 @mcp.tool()
 async def search_messages(
     query: str,
@@ -369,10 +288,15 @@ async def aggregate_messages(
     """
     Считает частоты значений одного поля за всё окно времени и возвращает top N бакетов.
 
+    Поле `field` должно поддерживать terms-агрегацию в Elasticsearch (часто это `keyword`
+    или низкокардинальные поля: `logger`, `source`, `level`). Для полного текста сообщения
+    в индексе может не быть подходящего маппинга — тогда Graylog вернёт ошибку; пробуйте
+    другое поле или `search_messages`, не полагайтесь на скрытые обходные пути.
+
     Когда использовать:
     - нужны самые частые ошибки;
     - нужен top 3 / top 10 / рейтинг значений;
-    - нужно сгруппировать по message, logger, source, level и т.п.
+    - нужно сгруппировать по logger, source, level или другому подходящему полю.
 
     Когда не использовать:
     - если нужны примеры строк;
@@ -383,7 +307,7 @@ async def aggregate_messages(
     - JSON с полем, query, range_seconds и response из terms aggregation.
 
     Пример:
-    - field="message", query="gl2_source_input:<id> AND (level:3 OR level:ERROR)", timeframe="1d", size=3.
+    - field="logger", query="gl2_source_input:<id> AND (level:3 OR level:ERROR)", timeframe="1d", size=5.
     """
     field = (field or "").strip()
     if not field:
@@ -406,14 +330,6 @@ async def aggregate_messages(
             },
         )
     except httpx.HTTPStatusError as exc:
-        if _can_fallback_to_client_side_terms(exc, field):
-            try:
-                fallback = await _client_side_terms_aggregation(query, field, range_sec, size)
-            except httpx.HTTPStatusError as inner_exc:
-                return _format_graylog_http_error(inner_exc)
-            except httpx.RequestError as inner_exc:
-                return f"Сеть / запрос: {inner_exc!s}"
-            return _compact_json(fallback, limit=80_000)
         return _format_graylog_http_error(exc)
     except httpx.RequestError as exc:
         return f"Сеть / запрос: {exc!s}"
@@ -443,7 +359,7 @@ async def list_streams() -> str:
 
     Когда не использовать:
     - если пользователь называет окружение, хост или input;
-    - если нужно найти gl2_source_input для inhouse1.
+    - если нужно найти gl2_source_input для конкретного input.
 
     Пример:
     - "покажи streams" или "какой stream у этой системы?".
@@ -483,7 +399,7 @@ async def list_inputs() -> str:
     Возвращает список inputs.
 
     Когда использовать:
-    - пользователь называет окружение или input-name вроде inhouse1;
+    - пользователь называет окружение или input-name;
     - нужно сопоставить title input с gl2_source_input:<id>;
     - нужно подготовить фильтр для поиска логов.
 
@@ -492,7 +408,7 @@ async def list_inputs() -> str:
     - если задача не привязана к конкретному окружению/input.
 
     Пример:
-    - "найди inhouse1 и покажи его id для фильтрации логов".
+    - "покажи inputs и их id для фильтрации логов".
     """
     if (msg := _graylog_config_error()) is not None:
         return msg

@@ -11,23 +11,30 @@ from app.agents import get_agent
 from app.config import AppConfig
 from app.orchestration.agent_registry import AgentSpec, SPECIALIST_BY_ROLE
 from app.orchestration.prompts import build_synthesize_system_prompt
+from app.orchestration.specialist_outcome import (
+    delegate_fingerprint,
+    looks_like_llm_policy_refusal,
+    looks_like_specialist_failure,
+    outcome_summary,
+)
 from app.orchestration.state import GraphState
 
 log = logging.getLogger("ai_house.orchestration.nodes")
 
+_FP_KEY = {"logs": "logs_success_fingerprint", "db": "db_success_fingerprint", "code": "code_success_fingerprint"}
+_INV_KEY = {"logs": "logs_invocations", "db": "db_invocations", "code": "code_invocations"}
+
+
+def _looks_like_empty_synthesis(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return True
+    compact = "".join(normalized.split())
+    return compact in {"{}", "```{}```", "```json{}```"}
+
 
 def _app_config() -> AppConfig:
     return get_config()["configurable"]["app_config"]
-
-
-def _merge_slot(prev: str | None, new: str) -> str:
-    p = (prev or "").strip()
-    n = (new or "").strip()
-    if not p:
-        return n
-    if not n:
-        return p
-    return f"{p}\n\n--- этап ---\n\n{n}"
 
 
 def _specialist_inputs(state: GraphState) -> tuple[str, str]:
@@ -49,30 +56,12 @@ def _clear_supervisor_task() -> dict:
     return {"supervisor_task": "", "supervisor_context_hint": ""}
 
 
-def _looks_like_tool_error(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    markers = (
-        "http ",
-        "сеть / запрос",
-        "ошибка",
-        "агент логов:",
-        "graylog не настроен",
-        "ошибка mcp",
-        "mcp-сессия graylog не подключена",
-    )
-    return t.startswith(markers) or "не удалось" in t
-
-
 def _deterministic_error_response(logs_text: str) -> str:
-    facts: list[str] = []
-    for line in (logs_text or "").splitlines():
-        cleaned = line.strip()
-        if cleaned and cleaned != "--- этап ---":
-            facts.append(cleaned)
-    if not facts:
+    text = (logs_text or "").strip()
+    if not text:
         facts = ["Не удалось получить данные из логов."]
+    else:
+        facts = [text[:2000]] if len(text) <= 2000 else [text[:1980] + "…"]
     bullets = "\n".join(f"- {fact}" for fact in facts[:5])
     return (
         "1. Кратко: не удалось получить итоговые данные из логов.\n"
@@ -85,6 +74,8 @@ def _deterministic_error_response(logs_text: str) -> str:
 async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
     cfg = _app_config()
     msg, ctx = _specialist_inputs(state)
+    fp_key = _FP_KEY[spec.role]
+    inv_key = _INV_KEY[spec.role]
     enabled_flags = {
         "db": cfg.postgres.enabled,
         "logs": cfg.graylog.enabled,
@@ -93,7 +84,12 @@ async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
     if not enabled_flags.get(spec.role):
         text = spec.disabled_message
         return {
-            spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+            spec.result_slot: text,
+            fp_key: "",
+            inv_key: 1,
+            "last_specialist_role": spec.role,
+            "last_specialist_status": "error",
+            "last_specialist_error": text,
             "agents_used": [spec.role],
             **_clear_supervisor_task(),
         }
@@ -101,17 +97,49 @@ async def _run_specialist(state: GraphState, spec: AgentSpec) -> dict:
     if not cls:
         text = spec.unavailable_message
         return {
-            spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+            spec.result_slot: text,
+            fp_key: "",
+            inv_key: 1,
+            "last_specialist_role": spec.role,
+            "last_specialist_status": "error",
+            "last_specialist_error": text,
             "agents_used": [spec.role],
             **_clear_supervisor_task(),
         }
+    user_q = (state.get("user_message") or "").strip()
+    fp = delegate_fingerprint(user_q, msg, ctx)
     text = await cls(cfg).run(msg, context=ctx)
+    if spec.role == "logs" and looks_like_llm_policy_refusal(text):
+        text = (
+            "Агент логов: провайдер LLM отказался сформулировать ответ по данным Graylog "
+            "(часто из‑за объёма stack trace и полей при `fields=full`). "
+            "Инструменты при этом могли отработать успешно — повторите запрос или сузьте выборку."
+        ).strip()
     log.info("[%s] %s done", state.get("trace_id", ""), spec.node_name)
-    return {
-        spec.result_slot: _merge_slot(state.get(spec.result_slot), text),
+    ok = not looks_like_specialist_failure(text)
+    out: dict = {
+        spec.result_slot: text,
+        inv_key: 1,
+        "last_specialist_role": spec.role,
         "agents_used": [spec.role],
         **_clear_supervisor_task(),
     }
+    if ok:
+        out[fp_key] = fp
+        out["last_specialist_status"] = "success"
+        out["last_specialist_error"] = ""
+        log.info(
+            "[%s] %s success fingerprint=%s summary=%r",
+            state.get("trace_id", ""),
+            spec.role,
+            fp[:12],
+            outcome_summary(text)[:80],
+        )
+    else:
+        out[fp_key] = ""
+        out["last_specialist_status"] = "error"
+        out["last_specialist_error"] = (text or "").strip()
+    return out
 
 
 def make_specialist_node(role: str) -> Callable[[GraphState], dict]:
@@ -128,9 +156,15 @@ async def node_synthesize(state: GraphState) -> dict:
     cfg = _app_config()
     gen = (state.get("final_response") or "").strip()
     logs_text = (state.get("logs_result") or "").strip()
-    if _looks_like_tool_error(logs_text):
+    truncated = bool(state.get("supervisor_truncated"))
+    if looks_like_specialist_failure(logs_text):
+        body = _deterministic_error_response(logs_text)
+        if truncated:
+            body = (
+                "Достигнут лимит шагов оркестратора; ниже последний зафиксированный результат по логам.\n\n" + body
+            )
         return {
-            "final_response": _deterministic_error_response(logs_text),
+            "final_response": body,
             "agents_used": ["synthesize"],
         }
     if cfg.llm_status() != "ok":
@@ -140,18 +174,25 @@ async def node_synthesize(state: GraphState) -> dict:
             f"## Код\n{state.get('code_result', '')}",
         ]
         if gen:
-            parts.append(f"## Общий агент\n{gen}")
+            parts.append(f"## Оркестратор\n{gen}")
         return {"final_response": "\n\n".join(parts), "agents_used": ["synthesize"]}
 
     from app.shared.llm import build_llm
 
     llm = build_llm(cfg)
+    trunc_note = ""
+    if truncated:
+        trunc_note = (
+            "\n\n[Система] Достигнут лимит шагов оркестратора (GRAPH_SUPERVISOR_MAX_STEPS). "
+            "Сведи ответ из последних результатов ниже; не требуй новых вызовов специалистов.\n"
+        )
     user_block = (
         f"Вопрос пользователя:\n{state.get('user_message', '')}\n\n"
         f"## БД\n{state.get('db_result', '')}\n\n"
         f"## Логи\n{state.get('logs_result', '')}\n\n"
         f"## Код\n{state.get('code_result', '')}\n\n"
-        f"## Общий агент (если вызывался)\n{gen}"
+        f"## Оркестратор (если отвечал напрямую)\n{gen}"
+        f"{trunc_note}"
     )
     try:
         text = await llm.complete(
@@ -163,7 +204,21 @@ async def node_synthesize(state: GraphState) -> dict:
                 {"role": "user", "content": user_block},
             ]
         )
-        return {"final_response": text.strip(), "agents_used": ["synthesize"]}
+        final_text = (text or "").strip()
+        if _looks_like_empty_synthesis(final_text):
+            log.warning(
+                "[%s] synthesize returned empty placeholder; fallback to deterministic sections",
+                state.get("trace_id", ""),
+            )
+            parts = [
+                f"## БД\n{state.get('db_result', '')}",
+                f"## Логи\n{state.get('logs_result', '')}",
+                f"## Код\n{state.get('code_result', '')}",
+            ]
+            if gen:
+                parts.append(f"## Оркестратор\n{gen}")
+            return {"final_response": "\n\n".join(parts), "agents_used": ["synthesize"]}
+        return {"final_response": final_text, "agents_used": ["synthesize"]}
     except Exception:
         log.exception("synthesize failed")
         parts = [
@@ -172,5 +227,5 @@ async def node_synthesize(state: GraphState) -> dict:
             f"## Код\n{state.get('code_result', '')}",
         ]
         if gen:
-            parts.append(f"## Общий агент\n{gen}")
+            parts.append(f"## Оркестратор\n{gen}")
         return {"final_response": "\n\n".join(parts), "agents_used": ["synthesize"]}

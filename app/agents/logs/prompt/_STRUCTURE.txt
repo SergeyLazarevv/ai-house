@@ -5,3 +5,5 @@
   2) Код агента добавляет: краткий формат TOOL_CALL + каталог инструментов, полученный из Graylog MCP server через list_tools.
 
 При изменении аргументов инструмента правьте **app/mcp_servers/graylog.py**. Не дублируйте схему вручную в prompt/.
+
+Код рядом с prompt/: **agent.py** (цикл LLM↔MCP), **system_prompt.py** (сборка system), **parse.py**, **responses.py**, **inputs.py**.

@@ -7,29 +7,38 @@ from contextlib import AsyncExitStack
 from app.agents.base import BaseAgent
 from app.agents.prompt_loader import load_agent_prompt
 from app.config import AppConfig
-from app.shared.connectors.gitlab import GitLabConnector
+from app.shared.connectors.gitlab import GitLabConnector, format_tools_for_llm
 from app.shared.llm import build_llm
 from app.shared.tool_parser import parse_tool_call
 
 
 class CodeAgent(BaseAgent):
-    """Специализированный агент: инструменты только GitLab REST."""
+    """Специализированный агент: инструменты только GitLab MCP."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._llm = build_llm(config)
-        self._connector = GitLabConnector(config.gitlab.url, config.gitlab.token)
+        self._connector = GitLabConnector(config.gitlab)
 
     async def run(self, message: str, context: str = "") -> str:
         if not self._connector.is_configured:
-            return "Агент кода: GitLab не настроен (GITLAB_URL)."
+            return "Агент кода: GitLab не настроен (GITLAB_URL / GITLAB_TOKEN)."
         user_text = f"{context}\n\nЗапрос: {message}" if context else message
-        system = load_agent_prompt("code")
         async with AsyncExitStack() as stack:
-            await self._connector.connect(stack)
+            try:
+                await self._connector.connect(stack)
+            except Exception as e:
+                return f"Агент кода: не удалось поднять GitLab-коннектор: {e!s}"
             tool_names = self._connector.tool_names
+            system = "\n\n".join(
+                [
+                    load_agent_prompt("code").strip(),
+                    format_tools_for_llm(self._connector.tools),
+                    "Инструменты: " + ", ".join(tool_names),
+                ]
+            )
             messages = [
-                {"role": "system", "content": system + "\nИнструменты: " + ", ".join(tool_names)},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_text},
             ]
             for _ in range(5):

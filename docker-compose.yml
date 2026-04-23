@@ -18,6 +18,8 @@ services:
       - AGENT_DB_ENABLED=${AGENT_DB_ENABLED:-true}
       - AGENT_CODE_ENABLED=${AGENT_CODE_ENABLED:-true}
       - POSTGRES_MCP_DSN=${POSTGRES_MCP_DSN}
+      - POSTGRES_URL=${POSTGRES_URL}
+      - POSTGRES_DSN=${POSTGRES_DSN}
       - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
     extra_hosts:

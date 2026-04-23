@@ -46,7 +46,16 @@ async def run_graph(message: str, config: AppConfig, trace_id: str | None = None
 
     graph = get_compiled_graph()
     result = await graph.ainvoke(
-        {"user_message": msg, "trace_id": trace_id},
+        {
+            "user_message": msg,
+            "trace_id": trace_id,
+            "logs_invocations": 0,
+            "db_invocations": 0,
+            "code_invocations": 0,
+            "last_specialist_role": "",
+            "last_specialist_status": "none",
+            "last_specialist_error": "",
+        },
         config={"configurable": {"app_config": config}},
     )
     out = result.get("final_response")

@@ -162,7 +162,10 @@ async def openai_chat_completions(req: OpenAIChatRequest):
                 return content["text"]
             if isinstance(content.get("content"), str):
                 return content["content"]
-        return str(content)
+            return ""
+        if isinstance(content, (int, float, bool)):
+            return str(content)
+        return ""
 
     user_messages = [_content_to_text(m.content) for m in req.messages if m.role == "user" and m.content]
     if user_messages:
@@ -184,6 +187,10 @@ async def openai_chat_completions(req: OpenAIChatRequest):
         log.exception("Ошибка OpenAI-совместимого endpoint")
         raise HTTPException(status_code=500, detail=str(e))
 
+    answer_text = _content_to_text(answer).strip()
+    if not answer_text:
+        answer_text = "Извините, не удалось сформировать текстовый ответ."
+
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     model = req.model or "ai-house-default"
@@ -197,7 +204,7 @@ async def openai_chat_completions(req: OpenAIChatRequest):
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
+                        "delta": {"role": "assistant"},
                         "finish_reason": None,
                     }
                 ],
@@ -212,7 +219,7 @@ async def openai_chat_completions(req: OpenAIChatRequest):
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": answer},
+                        "delta": {"content": answer_text},
                         "finish_reason": None,
                     }
                 ],
@@ -253,7 +260,7 @@ async def openai_chat_completions(req: OpenAIChatRequest):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": answer},
+                "message": {"role": "assistant", "content": answer_text},
                 "finish_reason": "stop",
             }
         ],
